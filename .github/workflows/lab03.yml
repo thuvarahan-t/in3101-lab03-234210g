@@ -1,0 +1,101 @@
+name: Verify Lab 03
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DB_ROOT_PASSWORD: library-lab-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Verify the standalone MySQL volume
+        shell: bash
+        run: |
+          docker run --rm hello-world
+          start_mysql() {
+            docker run -d --name library-mysql \
+              -e MYSQL_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
+              -e MYSQL_DATABASE=library_db -p 3307:3306 \
+              -v library-data:/var/lib/mysql mysql:8.4
+            for attempt in {1..60}; do
+              if query 'SELECT 1' >/dev/null 2>&1; then return 0; fi
+              sleep 2
+            done
+            docker logs library-mysql
+            return 1
+          }
+          query() {
+            docker exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" library-mysql \
+              mysql --protocol=TCP -h 127.0.0.1 -uroot -N library_db -e "$1"
+          }
+          trap 'docker rm -f library-mysql >/dev/null 2>&1 || true' EXIT
+          start_mysql
+          query "CREATE TABLE note (msg VARCHAR(50)); INSERT INTO note VALUES ('stored in a volume');"
+          docker rm -f library-mysql
+          start_mysql
+          test "$(query 'SELECT msg FROM note')" = 'stored in a volume'
+      - name: Build the API and check standalone startup
+        run: |
+          mvn -B clean package -DskipTests
+          docker build -t library-api .
+          trap 'docker rm -f api-test >/dev/null 2>&1 || true' EXIT
+          docker run -d --name api-test -p 8080:8080 library-api
+          status="$(timeout 90 docker wait api-test)"
+          test "$status" -ne 0
+          docker logs api-test > /tmp/library-api-standalone.log 2>&1
+          grep -Ei 'communications link failure|connection refused' /tmp/library-api-standalone.log
+      - name: Verify Compose, Books API, Swagger and persistence
+        shell: bash
+        run: |
+          trap 'docker compose logs --tail 100; docker compose down' EXIT
+          books=http://localhost:8080/api/books
+          wait_for_api() {
+            curl --fail --silent --show-error --retry 30 --retry-all-errors \
+              --retry-delay 2 --max-time 5 "$books" >/dev/null
+          }
+          docker compose up --build -d --wait --wait-timeout 180
+          wait_for_api
+          docker compose ps
+          curl -fsSL http://localhost:8080/swagger-ui.html >/dev/null
+          curl -fsS http://localhost:8080/v3/api-docs | jq -e '.paths["/api/books"].post' >/dev/null
+          for title in '234210G - Clean Code' 'Refactoring' 'Effective Java'; do
+            payload="$(jq -nc --arg title "$title" '{title:$title,author:"Test Author",price:25}')"
+            status="$(curl -sS -o /tmp/book.json -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" "$books")"
+            test "$status" = 201
+            jq -e --arg title "$title" '.title == $title and (.id > 0)' /tmp/book.json
+          done
+          curl -fsS "$books" | jq -eS 'sort_by(.id) | select(length == 3)' > /tmp/books-before.json
+          docker compose exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" db \
+            mysql -uroot -N library_db -e 'SELECT title FROM book' > /tmp/mysql-books.txt
+          grep -Fx '234210G - Clean Code' /tmp/mysql-books.txt
+          test "$(wc -l < /tmp/mysql-books.txt)" -eq 3
+          id="$(jq -r '.[0].id' /tmp/books-before.json)"
+          curl -fsS "$books/$id" | jq -e --argjson id "$id" '.id == $id'
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d '{"title":"","author":"","price":-1}' "$books")"
+          test "$status" = 400
+          docker compose down
+          docker compose up -d --wait --wait-timeout 180
+          wait_for_api
+          curl -fsS "$books" | jq -eS 'sort_by(.id)' > /tmp/books-after.json
+          diff -u /tmp/books-before.json /tmp/books-after.json
+          cat /tmp/books-after.json
+          payload='{"title":"Updated title","author":"Test Author","price":30}'
+          curl -fsS -X PUT -H 'Content-Type: application/json' -d "$payload" "$books/$id" | jq -e '.title == "Updated title"'
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "$books/$id")"
+          test "$status" = 204
+          status="$(curl -sS -o /dev/null -w '%{http_code}' "$books/$id")"
+          test "$status" = 404
+
